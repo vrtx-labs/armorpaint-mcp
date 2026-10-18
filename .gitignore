@@ -95,3 +95,9 @@ desktop.ini
 # Last word wins in gitignore. Protocol tests ship sample request/response and
 # heartbeat files; the rules above must not reach into them.
 !tests/fixtures/**
+
+# Generated local artwork inspection artifacts; retain the reproducible scripts.
+/work/*.png
+/work/*.npz
+/work/*.blend*
+/work/mesh_report.json

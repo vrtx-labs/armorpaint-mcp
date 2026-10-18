@@ -24,12 +24,9 @@ call is a file round-trip through the spool directory — see ``docs/PROTOCOL.md
 wire contract and ``transport.py`` for how the spool path is discovered. Start with
 ``ap_bridge_status``: it diagnoses the connection without needing the bridge to answer.
 
-Scope note, because it shapes the whole tool surface: ArmorPaint's plugin API is 529
-bindings, and **layers are almost absent from it** — ``script_fill_layer`` is the only layer
-operation in the entire table, and ``slot_layer_t`` is not a registered struct, so layers
-cannot be created, listed, renamed, reordered, masked or blended from a plugin. There are
-also no bake-run, undo/redo, camera-pose or UI-automation bindings. Those tools are not
-missing here by oversight; they are impossible. See ``docs/MINIC_DIALECT_AND_API.md`` §2.14.
+This local extension targets ArmorPaint revision fcf10dd plus the native changes
+documented in docs/LOCAL_EXTENSIONS.md. It adds live layers, masks, groups,
+native undo/redo, view control, texture resizing, asset packing and PBR export.
 """
 
 from __future__ import annotations
@@ -81,6 +78,10 @@ DEFAULT_TIMEOUT_S = 30.0
 # Per-op deadlines. Most ops answer in a frame or two; imports, exports and saves are
 # measured in seconds because the plugin runs them inline on the render thread.
 OP_TIMEOUTS: dict[str, float] = {
+    "export_pbr": 600,
+    "texture_resolution": 180,
+    "pack_assets": 300,
+    "layer_create": 180,
     "ping": 10,
     "get_app_info": 10,
     "bridge_set_enabled": 10,
@@ -243,8 +244,8 @@ PAINT_CHANNELS = (
     "subsurface",
 )
 
-CONFIG_INTS = ("window_w", "window_h", "undo_steps", "layer_res", "workspace", "workflow")
-CONFIG_FLOATS = ("window_scale", "rp_supersample", "camera_fov")
+CONFIG_INTS = ("window_w", "window_h", "undo_steps", "layer_res", "tools", "materials")
+CONFIG_FLOATS = ("window_scale", "rp_supersample", "camera_fov", "rp_bloom", "rp_grain")
 CONFIG_STRINGS = ("keymap", "theme")
 CONFIG_BOOLS = ("brush_live", "node_previews", "material_live")
 
@@ -490,6 +491,30 @@ def _b(description: str, **extra: Any) -> dict[str, Any]:
 _PATH_NOTE = "Absolute path, forward slashes (backslashes are converted for you)."
 
 TOOLS: list[types.Tool] = [
+    _tool("ap_pack_assets", "Embed imported texture assets and enable packing on subsequent project saves."),
+    _tool("ap_texture_resolution", "Resize project layer textures to 2048, 4096 or 8192.", {"size": _i("Square texture resolution.", enum=[2048,4096,8192])}, ["size"]),
+    _tool("ap_export_pbr", "Export visible layers as PNG BaseColor, NormalGL, Occlusion, Roughness, Metallic and EmissionMask maps.",
+          {"directory": _s("Absolute destination directory."), "name": _s("Filename prefix without extension.")}, ["directory","name"]),
+    _tool("ap_view_set", "Choose a standard camera view and optionally orbit or zoom from it.",
+          {"view": _s("View.", enum=["front","back","top","bottom","left","right"]),
+           "orbit_x": _n("Horizontal orbit in radians.", default=0), "orbit_y": _n("Vertical orbit in radians.", default=0),
+           "zoom": _n("Relative camera movement.", default=0)}, ["view"]),
+    _tool("ap_history_status", "Read native undo and redo counts."),
+    _tool("ap_undo", "Undo one native history step. Returns an error when history is empty."),
+    _tool("ap_redo", "Redo one native history step. Returns an error when history is empty."),
+    _tool("ap_layer_list", "List live layers bottom to top, including masks, groups, opacity and blend mode."),
+    _tool("ap_layer_select", "Select a layer by its unique name.", {"name": _s("Layer name.")}, ["name"]),
+    _tool("ap_layer_create", "Create a paint layer, fill layer, mask, or group. Masks and groups use the active layer as parent.",
+          {"name": _s("New layer name."), "kind": _s("Layer kind.", enum=["paint", "fill", "black_mask", "white_mask", "fill_mask", "group"], default="paint")}, ["name"]),
+    _tool("ap_layer_delete", "Delete a layer with native undo support. The final paint layer is protected.", {"name": _s("Layer name.")}, ["name"]),
+    _tool("ap_layer_duplicate", "Duplicate a layer with native undo support.", {"name": _s("Layer name.")}, ["name"]),
+    _tool("ap_layer_move", "Move a layer to an index counted from the bottom, respecting mask/group constraints.", {"name": _s("Layer name."), "index": _i("Destination index from bottom.", minimum=0)}, ["name", "index"]),
+    _tool("ap_layer_update", "Update layer properties. Each changed property is a native undo step.",
+          {"name": _s("Existing layer name."), "new_name": _s("Rename to this name."),
+           "opacity": _n("Opacity.", minimum=0, maximum=1), "visible": _b("Visibility."),
+           "blending": _i("Native blend mode: mix=0, darken=1, multiply=2, screen=4, overlay=7.", minimum=0, maximum=17),
+           "object": _s("Restrict to a paint object by name; empty means all objects."),
+           "group": _s("Move into this group; empty removes grouping.")}, ["name"]),
     # ---- bridge & session -------------------------------------------------
     _tool(
         "ap_bridge_status",
@@ -716,12 +741,14 @@ TOOLS: list[types.Tool] = [
             "theme": _s("Theme name."),
             "undo_steps": _i("Undo history depth."),
             "camera_fov": _n("Camera field of view in radians."),
-            "layer_res": _i("Default layer resolution for NEW layers (e.g. 2048)."),
+            "layer_res": _i("Default layer resolution index: 0=2048, 1=4096, 2=8192. Use ap_texture_resolution to resize the project."),
             "brush_live": _b("Live brush preview."),
             "node_previews": _b("Node thumbnails in the node editor."),
             "material_live": _b("Live material preview."),
-            "workspace": _i("Workspace index."),
-            "workflow": _i("Workflow index."),
+            "rp_bloom": _n("Emissive bloom intensity.", minimum=0),
+            "rp_grain": _n("Film grain amount.", minimum=0),
+            "tools": _i("Tool workspace index."),
+            "materials": _i("Material workflow index."),
         },
     ),
     _tool(
@@ -1087,6 +1114,45 @@ def _build_wire_args(name: str, a: dict[str, Any]) -> dict[str, Any]:
     exceptions and unchecked pointer dereference, so a malformed request must be stopped on
     this side of the mailbox.
     """
+    if name == "ap_texture_resolution":
+        size = _req_int(a, "size", 2048, 8192)
+        if size not in (2048,4096,8192):
+            raise BadArgs("Resolution must be 2048, 4096 or 8192.")
+        return {"size": size}
+    if name == "ap_export_pbr":
+        prefix = _req_str(a, "name")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", prefix):
+            raise BadArgs("Filename prefix must use letters, digits, underscores or hyphens.")
+        return {"directory": _norm_path(a,"directory"), "name": prefix}
+    if name == "ap_view_set":
+        view = _req_str(a, "view")
+        if view not in ("front","back","top","bottom","left","right"):
+            raise BadArgs("Unknown standard view.")
+        return {"view": view, "orbit_x": _opt_float(a,"orbit_x",-6.284,6.284) or 0,
+                "orbit_y": _opt_float(a,"orbit_y",-3.142,3.142) or 0, "zoom": _opt_float(a,"zoom",-10,10) or 0}
+    if name in ("ap_history_status", "ap_undo", "ap_redo", "ap_layer_list", "ap_pack_assets"):
+        return {}
+    if name.startswith("ap_layer_"):
+        out = {"name": _req_str(a, "name")}
+        if name == "ap_layer_create":
+            kind = a.get("kind", "paint")
+            if kind not in ("paint", "fill", "black_mask", "white_mask", "fill_mask", "group"):
+                raise BadArgs("Invalid layer kind.", arg="kind")
+            out["kind"] = kind
+        elif name == "ap_layer_move":
+            out["index"] = _req_int(a, "index", 0)
+        elif name == "ap_layer_update":
+            for key in ("new_name", "object", "group"):
+                if key in a:
+                    if not isinstance(a[key], str):
+                        raise BadArgs(f"'{key}' must be a string.", arg=key)
+                    out[key] = a[key]
+            out.update(_drop_none({"opacity": _opt_float(a, "opacity", 0, 1),
+                                   "visible": _opt_bool(a, "visible"),
+                                   "blending": _opt_int(a, "blending", 0, 17)}))
+            if len(out) == 1:
+                raise BadArgs("Give at least one layer property.")
+        return out
     if name in ("ap_ping", "ap_get_app_info", "ap_project_new", "ap_project_save"):
         return {}
     if name in (
@@ -1447,12 +1513,11 @@ SERVER_INSTRUCTIONS = (
     "Drives a running ArmorPaint 1.0 (a 3D PBR texture painter) over a file mailbox. "
     "If any tool returns a transport error, call ap_bridge_status first — it diagnoses the "
     "connection without needing ArmorPaint to answer. "
-    "Two things about this app are worth knowing before planning work: (1) LAYERS are "
-    "essentially absent from ArmorPaint's plugin API — ap_fill_layer is the only layer "
-    "operation that exists, and layers cannot be listed, created, renamed, masked or "
-    "blended from here, so ask the user to do layer setup in the UI; (2) the MATERIAL NODE "
-    "GRAPH is fully scriptable (ap_node_list / ap_node_add / ap_node_connect / "
-    "ap_node_set_value + ap_material_update), which is where an agent has real leverage. "
+    "This local build supports live layer management, masks, groups, native undo/redo, "
+    "view control and emissive PBR export. Use ap_layer_list to inspect the live stack. "
+    "Fill layers retain their material; paint layers require ap_fill_layer after "
+    "editing and recompiling the material graph. Each changed layer property is a "
+    "separate history step. Undo history is session-local, not persisted with a project. "
     "Bulk data moves by path: ap_export_textures writes real PNGs, then ap_read_image_file "
     "shows you one."
 )

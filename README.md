@@ -1,5 +1,10 @@
 # armorpaint-mcp
 
+Local Windows extension: this checkout now includes layer management, native
+undo/redo, camera views, full-aspect viewport capture, texture resizing, asset
+packing and emissive PBR exports. See [docs/LOCAL_EXTENSIONS.md](docs/LOCAL_EXTENSIONS.md).
+The upstream API limitations described below refer to the older stock build.
+
 Drive [ArmorPaint](https://armorpaint.org) 1.0 from an MCP client.
 
 An MCP server (Python) plus a small in-app bridge (an ArmorPaint *plugin*, written in the app's

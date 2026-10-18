@@ -88,7 +88,7 @@
 //     caps below exist to keep the worst arm well inside that.
 // ============================================================================
 
-char *BRIDGE_VERSION = "1.0.0";
+char *BRIDGE_VERSION = "1.1.0";
 int   ENVELOPE_V     = 1;
 
 // Per-frame script-call budget. 48 stroke points cost 48*3 to_float calls; 64
@@ -102,11 +102,11 @@ int MAX_LIST_ITEMS    = 64;
 // minic runtime error that aborts the whole handler (minic.c:939), so this has
 // to be a flag rather than a try: set it to 1 only after applying the patch and
 // rebuilding.
-int HAVE_VIEWPORT_PATCH = 0;
+int HAVE_VIEWPORT_PATCH = 1;
 
 void        *plugin;
-ui_handle_t *h_panel;
-ui_handle_t *h_enabled;
+bool panel_expanded = true;
+bool bridge_checked = true;
 
 char *spool_root;
 char *dir_req;
@@ -867,9 +867,7 @@ char *dispatch(void *m) {
 		}
 		i1      = to_bool(s1);
 		enabled = i1;
-		if (h_enabled != NULL) {
-			h_enabled->b = i1; // keep the Plugins-tab checkbox in sync
-		}
+		bridge_checked = i1;
 		json_encode_begin();
 		json_encode_bool("enabled", enabled);
 		// Disabling stops on_update from polling AND from resetting the idle
@@ -961,7 +959,7 @@ char *dispatch(void *m) {
 		if (!file_here(s1)) {
 			return fail("not_found", string("no such file: %s", s1));
 		}
-		script_project_open(s1);
+		script_project_open(win_path(s1));
 		json_encode_begin();
 		json_encode_string("filepath", jesc(project_filepath_get()));
 		return json_encode_end();
@@ -1109,7 +1107,7 @@ char *dispatch(void *m) {
 			return fail("not_found", string("no such file: %s", s1));
 		}
 		// Dispatched by extension inside ArmorPaint: texture, mesh, or .arm material.
-		script_import_asset(s1, 0);
+		script_import_asset(win_path(s1), 0);
 		json_encode_begin();
 		json_encode_string("path", jesc(s1));
 		if (pr != NULL) {
@@ -1130,7 +1128,7 @@ char *dispatch(void *m) {
 		if (!file_here(s1)) {
 			return fail("not_found", string("no such file: %s", s1));
 		}
-		script_import_asset(s1, 1); // hdr_as_envmap
+		script_import_asset(win_path(s1), 1); // hdr_as_envmap
 		json_encode_begin();
 		json_encode_string("path", jesc(s1));
 		if (pr != NULL) {
@@ -1369,14 +1367,16 @@ char *dispatch(void *m) {
 		json_encode_i32("window_h", cf->window_h);
 		json_encode_f32("window_scale", cf->window_scale);
 		json_encode_f32("rp_supersample", cf->rp_supersample);
+		json_encode_f32("rp_bloom", cf->rp_bloom);
+		json_encode_f32("rp_grain", cf->rp_grain);
 		json_encode_i32("layer_res", cf->layer_res);
 		json_encode_i32("undo_steps", cf->undo_steps);
 		json_encode_f32("camera_fov", cf->camera_fov);
 		json_encode_i32("brush_live", cf->brush_live);
 		json_encode_i32("node_previews", cf->node_previews);
 		json_encode_i32("material_live", cf->material_live);
-		json_encode_i32("workspace", cf->workspace);
-		json_encode_i32("workflow", cf->workflow);
+		json_encode_i32("tools", cf->tools);
+		json_encode_i32("materials", cf->materials);
 		json_encode_string("keymap", jesc(cf->keymap));
 		json_encode_string("theme", jesc(cf->theme));
 		json_encode_string("recent_projects", sa_names(cf->recent_projects, MAX_LIST_ITEMS));
@@ -1407,13 +1407,13 @@ char *dispatch(void *m) {
 		if (s1 != NULL) {
 			cf->layer_res = to_int(s1);
 		}
-		s1 = arg(m, "workspace");
+		s1 = arg(m, "tools");
 		if (s1 != NULL) {
-			cf->workspace = to_int(s1);
+			cf->tools = to_int(s1);
 		}
-		s1 = arg(m, "workflow");
+		s1 = arg(m, "materials");
 		if (s1 != NULL) {
-			cf->workflow = to_int(s1);
+			cf->materials = to_int(s1);
 		}
 		s1 = arg(m, "window_scale");
 		if (s1 != NULL) {
@@ -1424,6 +1424,10 @@ char *dispatch(void *m) {
 			cf->rp_supersample = to_float(s1);
 		}
 		s1 = arg(m, "camera_fov");
+		s2 = arg(m, "rp_bloom");
+		if (s2 != NULL) { cf->rp_bloom = to_float(s2); }
+		s2 = arg(m, "rp_grain");
+		if (s2 != NULL) { cf->rp_grain = to_float(s2); }
 		if (s1 != NULL) {
 			cf->camera_fov = to_float(s1);
 		}
@@ -1461,8 +1465,8 @@ char *dispatch(void *m) {
 		json_encode_i32("brush_live", cf->brush_live);
 		json_encode_i32("node_previews", cf->node_previews);
 		json_encode_i32("material_live", cf->material_live);
-		json_encode_i32("workspace", cf->workspace);
-		json_encode_i32("workflow", cf->workflow);
+		json_encode_i32("tools", cf->tools);
+		json_encode_i32("materials", cf->materials);
 		json_encode_string("keymap", jesc(cf->keymap));
 		json_encode_string("theme", jesc(cf->theme));
 		json_encode_string("note", "keymap and theme are stored but ArmorPaint applies them only on reload");
@@ -1623,7 +1627,7 @@ char *dispatch(void *m) {
 			if (!file_here(s1)) {
 				return fail("not_found", string("no such file: %s", s1));
 			}
-			script_append_mesh(s1);
+			script_append_mesh(win_path(s1));
 			json_encode_begin();
 			json_encode_string("path", jesc(s1));
 			json_encode_string("source", "file");
@@ -2297,7 +2301,7 @@ char *dispatch(void *m) {
 			capture_h = 0;
 			return fail("internal", "gpu_create_render_target returned null");
 		}
-		viewport_capture_screenshot_to(capture_tex, 0.0, 0.0, i1, i2);
+		viewport_capture_full_to(capture_tex);
 		viewport_save_texture_to_file(capture_tex, s1);
 		if (c != NULL) {
 			c->capturing_screenshot = 0;
@@ -2311,6 +2315,144 @@ char *dispatch(void *m) {
 		return json_encode_end();
 	}
 
+	if (string_equals(op, "pack_assets")) {
+		i1 = script_pack_assets("");
+		script_set_pack_assets(1);
+		json_encode_begin();
+		json_encode_i32("packed", i1);
+		return json_encode_end();
+	}
+	if (string_equals(op, "texture_resolution")) {
+		if (!script_texture_resolution(arg_i(m, "size", 0))) { return fail("bad_args", "Unsupported texture resolution"); }
+		return "{\"resized\":true}";
+	}
+	if (string_equals(op, "export_pbr")) {
+		s1 = arg(m, "directory");
+		s2 = arg(m, "name");
+		if (s1 == NULL || s2 == NULL) { return fail("bad_args", "Missing export directory or name"); }
+		iron_create_directory(s1);
+		script_export_pbr(s1, s2);
+		return "{\"exported\":true}";
+	}
+	if (string_equals(op, "view_set")) {
+		s1 = arg(m, "view");
+		if (s1 == NULL) { return fail("bad_args", "Missing view"); }
+		if (string_equals(s1, "front")) { viewport_set_view(0,-1,0,1.5707963,0,0); }
+		else if (string_equals(s1, "back")) { viewport_set_view(0,1,0,1.5707963,0,3.1415926); }
+		else if (string_equals(s1, "right")) { viewport_set_view(1,0,0,1.5707963,0,1.5707963); }
+		else if (string_equals(s1, "left")) { viewport_set_view(-1,0,0,1.5707963,0,-1.5707963); }
+		else if (string_equals(s1, "top")) { viewport_set_view(0,0,1,0,0,0); }
+		else if (string_equals(s1, "bottom")) { viewport_set_view(0,0,-1,3.1415926,0,3.1415926); }
+		else { return fail("bad_args", "Unknown view"); }
+		viewport_orbit(arg_f(m,"orbit_x",0), arg_f(m,"orbit_y",0));
+		viewport_zoom(arg_f(m,"zoom",0));
+		return "{\"updated\":true}";
+	}
+	if (string_equals(op, "history_status") || string_equals(op, "undo") || string_equals(op, "redo")) {
+		if (string_equals(op, "undo")) {
+			if (!script_history_step(false)) {
+				return fail("empty_history", "No undo steps available");
+			}
+		}
+		if (string_equals(op, "redo")) {
+			if (!script_history_step(true)) {
+				return fail("empty_history", "No redo steps available");
+			}
+		}
+		json_encode_begin();
+		json_encode_i32("undos", script_history_count(false));
+		json_encode_i32("redos", script_history_count(true));
+		return json_encode_end();
+	}
+	if (string_equals(op, "layer_list")) {
+		json_encode_begin();
+		json_encode_begin_array("layers");
+		int count = script_layer_count();
+		if (count > MAX_LIST_ITEMS) { count = MAX_LIST_ITEMS; }
+		for (int li = 0; li < count; ++li) {
+			slot_layer_t *layer = script_layer_at(li);
+			json_encode_begin_object();
+			json_encode_i32("index", li);
+			json_encode_i32("id", layer->id);
+			json_encode_string("name", jesc(layer->name));
+			json_encode_bool("active", layer == c->layer);
+			json_encode_bool("visible", layer->visible);
+			json_encode_f32("opacity", layer->mask_opacity);
+			json_encode_i32("blending", layer->blending);
+			json_encode_i32("object_mask", layer->object_mask);
+			json_encode_bool("group", slot_layer_is_group(layer));
+			json_encode_bool("mask", slot_layer_is_mask(layer));
+			json_encode_bool("fill", layer->fill_material != NULL);
+			if (layer->parent != NULL) { json_encode_string("parent", jesc(layer->parent->name)); }
+			json_encode_end_object();
+		}
+		json_encode_end_array();
+		json_encode_i32("total", script_layer_count());
+		return json_encode_end();
+	}
+	if (starts_with(op, "layer_")) {
+		s1 = arg(m, "name");
+		if (s1 == NULL) { return fail("bad_args", "Missing layer name"); }
+		slot_layer_t *layer = script_layer_get(s1);
+		if (string_equals(op, "layer_create")) {
+			s2 = arg(m, "kind");
+			if (s2 == NULL) { s2 = "paint"; }
+			if (string_equals(s2, "paint")) { layer = script_layer_new(); }
+			else if (string_equals(s2, "fill")) { layer = script_layer_new_fill(); }
+			else if (string_equals(s2, "group")) { layer = script_layer_new_group(c->layer); }
+			else if (string_equals(s2, "black_mask")) { layer = script_layer_new_mask(c->layer, 0); }
+			else if (string_equals(s2, "white_mask")) { layer = script_layer_new_mask(c->layer, 1); }
+			else if (string_equals(s2, "fill_mask")) { layer = script_layer_new_mask(c->layer, 2); }
+			else { return fail("bad_args", "Unknown layer kind"); }
+			if (layer == NULL) { return fail("op_failed", "Cannot create this layer here"); }
+			script_layer_set_name(layer, s1);
+		}
+		else {
+			if (layer == NULL) { return fail("not_found", "Layer not found"); }
+			if (string_equals(op, "layer_select")) { script_layer_set(layer); }
+			else if (string_equals(op, "layer_delete")) {
+				int before = script_layer_count();
+				script_layer_delete(layer);
+				if (before == script_layer_count()) { return fail("op_failed", "Cannot delete the final paint layer"); }
+				return "{\"deleted\":true}";
+			}
+			else if (string_equals(op, "layer_duplicate")) { layer = script_layer_duplicate(layer); }
+			else if (string_equals(op, "layer_move")) {
+				if (!script_layer_move(layer, arg_i(m, "index", -1))) { return fail("op_failed", "Invalid layer move"); }
+			}
+			else if (string_equals(op, "layer_update")) {
+				s2 = arg(m, "new_name");
+				if (s2 != NULL) { script_layer_set_name(layer, s2); }
+				s2 = arg(m, "object");
+				if (s2 != NULL) {
+					ob = NULL;
+					if (!string_equals(s2, "")) {
+						ob = scene_get_child(s2);
+						if (ob == NULL) { return fail("not_found", "Object not found"); }
+					}
+					script_layer_set_object(layer, ob);
+				}
+				s2 = arg(m, "group");
+				if (s2 != NULL) {
+					slot_layer_t *parent = NULL;
+					if (!string_equals(s2, "")) {
+						parent = script_layer_get(s2);
+						if (parent == NULL) { return fail("not_found", "Group not found"); }
+					}
+					if (!script_layer_set_group(layer, parent)) { return fail("op_failed", "Invalid grouping"); }
+				}
+				if (!script_layer_set_properties(layer, arg_f(m, "opacity", -1.0), arg_i(m, "visible", -1), arg_i(m, "blending", -1))) {
+					return fail("bad_args", "Invalid layer properties");
+				}
+			}
+			else { return fail("unsupported", "Unknown layer operation"); }
+		}
+		if (layer == NULL) { return fail("op_failed", "Layer operation failed"); }
+		json_encode_begin();
+		json_encode_string("name", jesc(layer->name));
+		json_encode_i32("index", script_layer_index(layer));
+		return json_encode_end();
+	}
 	return fail("unsupported", string("unknown op: %s", op));
 }
 
@@ -2491,10 +2633,11 @@ void on_update() {
 // state but must never be the only way to observe it -- everything here is also
 // in heartbeat.json and get_app_info.
 void on_ui() {
-	if (ui_panel(h_panel, "MCP Bridge", 0, 0, 0)) {
+	if (ui_panel(&panel_expanded, "MCP Bridge", 0, 0, 0)) {
 		// The checkbox owns the flag. bridge_set_enabled writes h_enabled->b too,
 		// so the widget and the server never disagree.
-		enabled = ui_check(h_enabled, "Enabled", "");
+		ui_check(&bridge_checked, "Enabled", "");
+		enabled = bridge_checked;
 		if (enabled) {
 			ui_text("status: listening", UI_ALIGN_LEFT, 0);
 		}
@@ -2537,9 +2680,7 @@ void on_delete() {
 // and any function defined below it is never registered.
 void main() {
 	plugin       = plugin_create();
-	h_panel      = ui_handle_create();
-	h_enabled    = ui_handle_create();
-	h_enabled->b = enabled;
+	bridge_checked = enabled;
 
 	// data_path() is "./data" plus the platform separator, which is a backslash
 	// on Windows. Normalise it: backslashes inside minic string literals are
