@@ -4,7 +4,8 @@ import json
 import os
 import sys
 
-os.environ.setdefault("ARMORPAINT_DIR", "D:/Projects/armorpaint/paint/build/out")
+from pathlib import Path
+os.environ.setdefault("ARMORPAINT_DIR", str(Path(__file__).resolve().parents[2] / "armorpaint/paint/build/out"))
 from armorpaint_mcp.server import call_tool
 
 async def main():

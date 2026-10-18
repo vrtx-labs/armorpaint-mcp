@@ -7,6 +7,13 @@ The upstream API limitations described below refer to the older stock build.
 
 Drive [ArmorPaint](https://armorpaint.org) 1.0 from an MCP client.
 
+This local checkout also includes native GPU mesh-map baking, live native mask
+generator nodes and a legacy Machinery reconstruction (82 tools, bridge 1.3.0).
+See [docs/LIVE_MASK_GENERATORS.md](docs/LIVE_MASK_GENERATORS.md) for editable UI
+controls, triplanar projection and the dirt-mask example.
+See [docs/MACHINERY.md](docs/MACHINERY.md) for the workflow and accuracy limits.
+The new native bake tools require the modified companion ArmorPaint build.
+
 An MCP server (Python) plus a small in-app bridge (an ArmorPaint *plugin*, written in the app's
 embedded C dialect) let an agent open projects, inspect and edit materials and node graphs, paint,
 and export textures — against a **stock, unmodified ArmorPaint**, including the official paid binary.

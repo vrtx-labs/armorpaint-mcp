@@ -88,7 +88,9 @@
 //     caps below exist to keep the worst arm well inside that.
 // ============================================================================
 
-char *BRIDGE_VERSION = "1.1.0";
+char *BRIDGE_VERSION = "1.3.0";
+char *native_bake_path = "";
+int native_bake_job = 0;
 int   ENVELOPE_V     = 1;
 
 // Per-frame script-call budget. 48 stroke points cost 48*3 to_float calls; 64
@@ -1050,21 +1052,60 @@ char *dispatch(void *m) {
 		}
 		return json_encode_end();
 	}
+	else if (string_equals(op, "mask_generator_get")) {
+		s1 = script_mask_generator_info(arg_i(m, "id", -1));
+		if (s1 == NULL) { return fail("bad_args", "Select a material containing the requested mask generator node"); }
+		return s1;
+	}
+	else if (string_equals(op, "mask_generator_set")) {
+		s1 = arg(m, "changes");
+		if (s1 == NULL) { return fail("bad_args", "Missing generator parameters"); }
+		if (!script_mask_generator_set_values(arg_i(m, "id", -1), s1)) {
+			return fail("bad_args", "Unknown generator/parameter, non-finite value, or value outside its range");
+		}
+		return "{\"updated\":true,\"live\":true}";
+	}
+	else if (string_equals(op, "bake_map_start")) {
+		s1 = arg(m, "path");
+		if (s1 == NULL) { return fail("bad_args", "Missing PNG output path"); }
+		if (!script_bake_map(arg_i(m, "type", -1), win_path(s1), arg_i(m, "samples", 32))) {
+			return fail("op_failed", "Native bake could not start: another bake is active, target is invalid, or AO/thickness needs raytracing support");
+		}
+		native_bake_path = string_copy(s1);
+		native_bake_job = native_bake_job + 1;
+		json_encode_begin();
+		json_encode_i32("job", native_bake_job);
+		json_encode_bool("pending", 1);
+		json_encode_string("path", jesc(native_bake_path));
+		return json_encode_end();
+	}
+	else if (string_equals(op, "bake_map_status")) {
+		i1 = script_bake_status();
+		json_encode_begin();
+		json_encode_i32("job", native_bake_job);
+		json_encode_i32("state", i1);
+		json_encode_bool("pending", i1 == 1);
+		json_encode_bool("written", file_here(native_bake_path));
+		json_encode_string("path", jesc(native_bake_path));
+		return json_encode_end();
+	}
 	else if (string_equals(op, "project_list_texture_assets")) {
 		if (pr == NULL) {
 			return fail("no_project", "no project runtime");
 		}
-		if (pr->assets == NULL) {
-			return fail("no_project", "project has no asset list");
-		}
-		n = pr->assets->length;
+		n = script_asset_count();
 		json_encode_begin();
 		json_encode_i32("count", n);
 		if (n > MAX_LIST_ITEMS) {
 			n = MAX_LIST_ITEMS;
 		}
 		json_encode_i32("returned", n);
-		json_encode_string("names", sa_names(pr->assets, MAX_LIST_ITEMS));
+		char *asset_names = "";
+		for (int ai = 0; ai < n; ++ai) {
+			if (ai > 0) { asset_names = string("%s|%s", asset_names, jesc(script_asset_name(ai))); }
+			else { asset_names = jesc(script_asset_name(ai)); }
+		}
+		json_encode_string("names", asset_names);
 		json_encode_string("delimiter", "|");
 		json_encode_bool("live", 1);
 		return json_encode_end();
@@ -1611,6 +1652,10 @@ char *dispatch(void *m) {
 			return fail("not_found", string("no object named %s", s1));
 		}
 		ob->visible = to_bool(s2);
+		// Persist the visibility decision in the active stage as the UI does.
+		// A raw object flag alone is overwritten when a saved project is reopened.
+		if (to_bool(s2)) { script_stage_add_object(script_get_stage(), s1); }
+		script_stage_set_hidden(script_get_stage(), s1, !to_bool(s2));
 		if (c != NULL) {
 			c->ddirty = 2;
 		}

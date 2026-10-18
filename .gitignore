@@ -101,3 +101,5 @@ desktop.ini
 /work/*.npz
 /work/*.blend*
 /work/mesh_report.json
+/work/machinery_reference/
+/work/digitaljens_reference/

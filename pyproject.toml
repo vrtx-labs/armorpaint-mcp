@@ -26,6 +26,7 @@ armorpaint-mcp = "armorpaint_mcp.server:run"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+smart = ["numpy>=2.0", "pillow>=11.0", "h5py>=3.11", "lz4>=4.3"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["armorpaint_mcp"]

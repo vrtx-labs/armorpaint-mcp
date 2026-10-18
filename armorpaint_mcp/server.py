@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import re
 from functools import partial
 from pathlib import Path
@@ -141,7 +142,8 @@ OP_TIMEOUTS: dict[str, float] = {
 }
 
 # Tools answered entirely by this process — they work even when ArmorPaint is closed.
-LOCAL_TOOLS = frozenset({"ap_bridge_status", "ap_read_image_file"})
+LOCAL_TOOLS = frozenset({"ap_bridge_status", "ap_read_image_file", "ap_smart_material_info",
+    "ap_smart_material_generate", "ap_smart_material_apply", "ap_mesh_bake_start", "ap_mesh_bake_status", "ap_bake_mesh_maps"})
 
 # Bulk data travels by path; only these tools ever inline bytes into an MCP response.
 MAX_IMAGE_BYTES = 6_000_000
@@ -222,7 +224,7 @@ NODE_TYPES = frozenset(
     RGBTOBW SCRIPT_CPU SEPARATE_COLOR SEPXYZ SHADER_GPU STRING TEX_BAKE TEX_BRICK TEX_CAMERA
     TEX_CHECKER TEX_COORD TEX_GABOR TEX_GRADIENT TEX_IMAGE TEX_MAGIC TEX_NOISE TEX_TEXT
     TEX_VORONOI TEX_WAVE TILESHEET TILESHEET_ANIM UVMAP VALTORGB VALUE VECTOR VECT_MATH
-    VECT_ROTATE VECT_TRANSFORM WIREFRAME""".split()
+    VECT_ROTATE VECT_TRANSFORM WIREFRAME MASK_BUILDER MASK_EDGE_WEAR MASK_DIRT MASK_DUST""".split()
 )
 
 # Built-in primitives accepted by script_shape_add (minic_impl.c:702). Reported, not
@@ -1099,7 +1101,36 @@ TOOLS: list[types.Tool] = [
     ),
 ]
 
+TOOLS.extend([
+    _tool('ap_mask_generator_get','Inspect a native live mask generator in the active material. Returns its 50 controls, current values, groups and legal ranges.',
+        {'id':_i('Mask generator node id.',minimum=0)},['id']),
+    _tool('ap_mask_generator_set','Change native mask-generator parameters atomically. Use parameters, or parameter/value for one control. Fill masks reevaluate automatically in ArmorPaint; no PNG regeneration or manual fill call. One undo step per update.',
+        {'id':_i('Generator node id in the active material.',minimum=0),'parameter':_s('Legacy control identifier from ap_mask_generator_get; seed is $randomseed.'),'value':_n('New value within the advertised range.'),
+         'parameters':{'type':'object','additionalProperties':{'type':'number'},'description':'One or more legacy control identifiers and numeric values.'}},['id']),
+    _tool('ap_bake_mesh_maps','Bake the complete smart-material input set on the current ArmorPaint mesh using its native GPU bakers. Requires hardware raytracing for AO/thickness. Waits for all six bakes and writes PNGs and mesh_maps.npz. Do not edit the project during this operation.',
+        {'directory':_s('New output directory.'),'samples':_i('AO/thickness samples.',minimum=1,maximum=512,default=32)},['directory']),
+    _tool('ap_bake_map_start','Start a native ArmorPaint GPU mesh-map bake into a PNG. Uses a temporary paint layer, then restores the selected layer. Poll ap_bake_map_status before editing or starting another bake. AO and thickness require a raytracing-capable GPU.',
+        {'kind':_s('Native baker.',enum=['curvature','signed_curvature','normal','world_space_normal','position','ambient_occlusion','thickness']),
+         'path':_s('New PNG output path.'),'samples':_i('Raytracing samples.',minimum=1,maximum=512,default=32)},['kind','path']),
+    _tool('ap_bake_map_status','Read native baker state: 0 idle, 1 pending, 2 completed, negative output error. Only one native bake can be active.'),
+    _tool('ap_smart_material_info', 'Read the reconstructed legacy Machinery recipe, dependencies and accuracy limits.'),
+    _tool('ap_smart_material_generate', 'Prepare Machinery PBR images, a generator recipe and offline mask previews from baked mesh maps. ap_smart_material_apply assembles the masks as live native nodes. Requires the smart extra; not a Substance renderer.',
+        {'mesh_maps':_s('NPZ mesh-map archive or PNG directory.'), 'output':_s('Output directory.'),
+         'size':_i('Output resolution.',enum=[256,512,1024,2048,4096],default=2048),
+         'settings':{'type':'object','description':'Recipe overrides, including paint, dirty, dust, steel parameter dictionaries.'}}, ['mesh_maps','output']),
+    _tool('ap_smart_material_apply', 'Assemble a Machinery manifest with live native Mask Builder nodes and a shared Paint-group mask. Parameter changes refill masks in ArmorPaint without PNG regeneration. PBR base layers remain image-backed. Mesh must already be imported; UVs must match the baked maps.',
+        {'manifest':_s('Path to generated machinery.json.'),'prefix':_s('Layer name prefix.',default='Machinery')},['manifest']),
+    _tool('ap_mesh_bake_start','Start background CPU mesh-map baking using a local Blender executable. Requires a single-tile UV-mapped OBJ. Produces signed curvature, AO, thickness, position and object normal. Tangent normal is neutral; no high-poly transfer.',
+        {'mesh':_s('UV-mapped OBJ path.'),'output':_s('Output .npz path.'),'blender':_s('Path to blender.exe.'),
+         'size':_i('Bake resolution.',enum=[64,128,256,512,1024,2048],default=512),
+         'samples':_i('AO rays per texel.',minimum=1,maximum=256,default=16),
+         'radius':_n('AO radius as a fraction of mesh diagonal.',minimum=.001,maximum=2,default=.15),
+         'up_axis':_s('Source coordinate up axis.',enum=['Y','Z'],default='Y')},['mesh','output','blender']),
+    _tool('ap_mesh_bake_status','Poll a bake started in this MCP server session.',{'job':_s('Job identifier.')},['job']),
+])
 TOOL_NAMES = {tool.name for tool in TOOLS}
+_bake_jobs: dict[str, Any] = {}
+_smart_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1145,41 @@ def _build_wire_args(name: str, a: dict[str, Any]) -> dict[str, Any]:
     exceptions and unchecked pointer dereference, so a malformed request must be stopped on
     this side of the mailbox.
     """
+    if name == 'ap_mask_generator_get':
+        return {'id':_req_int(a,'id',0,2147483647)}
+    if name == 'ap_mask_generator_set':
+        parameters = a.get('parameters')
+        if parameters is None:
+            if 'value' not in a:
+                raise BadArgs('Supply parameters or parameter/value')
+            parameters = {_req_str(a,'parameter'):a['value']}
+        elif 'parameter' in a or 'value' in a:
+            raise BadArgs('Supply parameters or parameter/value, not both')
+        if not isinstance(parameters,dict) or not 1<=len(parameters)<=50:
+            raise BadArgs('parameters must contain 1 to 50 numeric controls',arg='parameters')
+        changes=[]
+        for parameter,value in parameters.items():
+            if not isinstance(parameter,str) or not re.fullmatch(r'[A-Za-z_$][A-Za-z0-9_]{0,79}',parameter):
+                raise BadArgs('Invalid generator parameter identifier',arg='parameters')
+            number=_num(value,parameter)
+            if not math.isfinite(number):
+                raise BadArgs('Generator values must be finite',arg='parameters')
+            changes.append(f'{parameter}={number}')
+        return {'id':_req_int(a,'id',0,2147483647),'changes':'|'.join(changes)}
+    if name == 'ap_bake_map_status':
+        return {}
+    if name == 'ap_bake_map_start':
+        kind = _req_str(a,'kind')
+        kinds = {'curvature':0,'normal':1,'world_space_normal':2,'position':5,
+                 'ambient_occlusion':10,'thickness':13,'signed_curvature':14}
+        if kind not in kinds:
+            raise BadArgs('Unknown native baker',arg='kind')
+        path = _norm_path(a,'path')
+        if not path.lower().endswith('.png') or not Path(path).parent.is_dir():
+            raise BadArgs('Use a PNG path in an existing directory',arg='path')
+        if Path(path).exists():
+            raise BadArgs('Bake output already exists; choose a new filename',arg='path')
+        return {'type':kinds[kind],'path':path,'samples':_opt_int(a,'samples',1,512) or 32}
     if name == "ap_texture_resolution":
         size = _req_int(a, "size", 2048, 8192)
         if size not in (2048,4096,8192):
@@ -1520,6 +1586,9 @@ SERVER_INSTRUCTIONS = (
     "separate history step. Undo history is session-local, not persisted with a project. "
     "Bulk data moves by path: ap_export_textures writes real PNGs, then ap_read_image_file "
     "shows you one."
+    " Native Mask Builder, Metal Edge Wear, Dirt Mask and Dust Mask nodes expose live "
+    "controls through ap_mask_generator_get/set. Updating these controls automatically "
+    "reevaluates fill masks; no offline generator or manual fill call is required."
 )
 
 server = Server(SERVER_NAME, version=__version__, instructions=SERVER_INSTRUCTIONS)
@@ -1539,6 +1608,106 @@ async def call_tool(
 
     try:
         # --- locally answered tools ---------------------------------------
+        if name == 'ap_bake_mesh_maps':
+            from .native_bake import bake_maps
+            directory = _norm_path(args,'directory')
+            samples = _opt_int(args,'samples',1,512) or 32
+            async def invoke_native(tool,**kwargs):
+                content = await call_tool(tool,kwargs)
+                payload = json.loads(next(v.text for v in content if v.type=='text'))
+                if not payload.get('ok'):
+                    raise OpFailed(f'{tool}: {payload.get("error",payload)}')
+                return payload.get('result',payload)
+            async with _smart_lock:
+                result = await bake_maps(directory,invoke_native,samples=samples)
+            return _text({'ok':True,'result':result})
+        if name in {'ap_smart_material_info','ap_smart_material_generate','ap_smart_material_apply'}:
+            try:
+                from .machinery import RECIPE, generate
+                from .material_stack import apply_manifest
+            except ImportError as exc:
+                raise BadArgs('Install smart-material dependencies with: python -m pip install -e ".[smart]"') from exc
+            if name == 'ap_smart_material_info':
+                return _text({'ok':True,'recipe':RECIPE,'dependencies':['Steel Rust and Wear','MG Mask Builder'],
+                    'live_mask_nodes':['MASK_BUILDER','MASK_EDGE_WEAR','MASK_DIRT','MASK_DUST'],
+                    'live_controls':['ap_mask_generator_get','ap_mask_generator_set'],
+                    'required_mesh_maps':['position','world_space_normal','ambient_occlusion','curvature','normal'],
+                    'limits':['Independent procedural approximation; Substance bytecode is not executed.',
+                              'Offline preview evaluation is at most 1024 squared; live mask nodes use the ArmorPaint texture resolution.',
+                              'CPU baker self-bakes one UV tile; high-poly normal transfer is not implemented.']})
+            if name == 'ap_smart_material_generate':
+                source = _norm_path(args,'mesh_maps')
+                output = _norm_path(args,'output')
+                settings = args.get('settings',{})
+                if not isinstance(settings,dict):
+                    raise BadArgs('settings must be an object',arg='settings')
+                async with _smart_lock:
+                    try:
+                        result = await asyncio.to_thread(generate,source,output,_opt_int(args,'size',256,4096) or 2048,settings)
+                    except (ValueError,KeyError,FileNotFoundError) as exc:
+                        raise BadArgs(str(exc)) from exc
+                return _text({'ok':True,'result':result})
+            path = _norm_path(args,'manifest')
+            prefix = args.get('prefix','Machinery')
+            if not isinstance(prefix,str) or not prefix.strip() or len(prefix)>80:
+                raise BadArgs('prefix must be a non-empty string of at most 80 characters',arg='prefix')
+            async def invoke(tool,**kwargs):
+                content = await call_tool(tool,kwargs)
+                payload = json.loads(next(v.text for v in content if v.type=='text'))
+                if not payload.get('ok'):
+                    raise OpFailed(f'{tool}: {payload.get("error",payload)}')
+                return payload.get('result',payload)
+            async with _smart_lock:
+                result = await apply_manifest(path,invoke,prefix)
+            return _text({'ok':True,'result':result})
+
+        if name == 'ap_mesh_bake_start':
+            import subprocess
+            import uuid
+            mesh = Path(_norm_path(args,'mesh'))
+            output = Path(_norm_path(args,'output'))
+            blender = Path(_norm_path(args,'blender'))
+            if not mesh.is_file() or mesh.suffix.lower()!='.obj' or not blender.is_file() or output.suffix.lower()!='.npz':
+                raise BadArgs('Supply an existing .obj mesh, Blender executable and .npz output path')
+            if output.exists():
+                raise BadArgs('Bake output already exists; choose a new path',arg='output')
+            size = _opt_int(args,'size',64,2048) or 512
+            if size not in (64,128,256,512,1024,2048):
+                raise BadArgs('Unsupported bake resolution',arg='size')
+            samples = _opt_int(args,'samples',1,256) or 16
+            radius = _opt_float(args,'radius',.001,2) or .15
+            axis = args.get('up_axis','Y')
+            if axis not in ('Y','Z'):
+                raise BadArgs('up_axis must be Y or Z',arg='up_axis')
+            output.parent.mkdir(parents=True,exist_ok=True)
+            log = output.with_suffix('.log')
+            stream = log.open('wb')
+            try:
+                process = subprocess.Popen([str(blender),'--background','--factory-startup','--python',
+                    str(Path(__file__).with_name('mesh_baker.py')),'--',str(mesh),str(output),
+                    '--size',str(size),'--samples',str(samples),'--radius',str(radius),'--up-axis',axis],
+                    stdout=stream,stderr=subprocess.STDOUT)
+            except Exception:
+                stream.close()
+                raise
+            job = uuid.uuid4().hex
+            _bake_jobs[job] = (process,stream,output,log)
+            return _text({'ok':True,'job':job,'pending':True,'output':str(output),'log':str(log)})
+
+        if name == 'ap_mesh_bake_status':
+            job = args.get('job')
+            if not isinstance(job,str) or job not in _bake_jobs:
+                raise BadArgs('Unknown job in this server session',arg='job')
+            process,stream,output,log = _bake_jobs[job]
+            code = process.poll()
+            if code is not None:
+                stream.close()
+            with log.open('rb') as reader:
+                reader.seek(max(0,log.stat().st_size-4000))
+                tail=reader.read().decode('utf-8','replace')
+            return _text({'ok':code is None or (code==0 and output.is_file()),'job':job,
+                'pending':code is None,'exit_code':code,'output':str(output),'log_tail':tail})
+
         if name == "ap_bridge_status":
             probe = _opt_bool(args, "probe")
             loop = asyncio.get_running_loop()
@@ -1656,6 +1825,12 @@ async def main() -> None:
 
 def run() -> None:
     """Console-script entry point (``armorpaint-mcp``)."""
+    # Initialize optional native numerical libraries before stdio worker tasks.
+    # Windows BLAS/DLL initialization must not block a live MCP request handler.
+    try:
+        from . import machinery  # noqa: F401
+    except ImportError:
+        pass  # Core bridge tools work without the optional smart extra.
     asyncio.run(main())
 
 

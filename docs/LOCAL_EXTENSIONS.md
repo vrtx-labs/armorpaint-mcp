@@ -1,5 +1,14 @@
 # Local ArmorPaint extensions
 
+## Current C: installation (2026-10-18)
+
+The active repositories are `C:/Projects/armorpaint` and
+`C:/Projects/armorpaint-mcp`. Bridge 1.3.0 exposes 82 tools, including live native
+mask-generator controls, native GPU
+bakers, signed curvature, live texture enumeration and the Machinery workflow.
+See [MACHINERY.md](MACHINERY.md). Build with ArmorPaint's `build-windows.ps1`.
+The older `D:` installation information below is retained as historical context.
+
 ## Installed components
 
 - ArmorPaint source: `D:/Projects/armorpaint`, baseline `fcf10dd`.
